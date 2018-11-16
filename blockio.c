@@ -16,19 +16,23 @@ int replaceNum = 0;
 int numBlocksRead = 0;
 pthread_mutex_t insertLock;
 
-struct cacheVars
+/*
+struct Node
 {
-  int cacheSize;
-  int blockSize;
-  pthread_mutex_t insertLock;
-  cacheVars()
-  {
-    cacheSize = -1;
-    blockSize = -1;
-    pthread_cond_init(&insertLock);
-
-  }
-}
+  int loc;
+  int blockID;
+  pthread_mutex_t lock;
+  Node(){id = -1; index = -1; pthread_mutex_init(&lock);}
+};
+*/
+struct Node
+{
+  int loc;
+  int blockID;
+  pthread_mutex_t lock;
+  Node * next;
+  Node(){id = -1; index = -1; pthread_mutex_init(&lock); next = NULL;}
+};
 
 //Data structure which will hold a disk block
 struct block
@@ -65,17 +69,107 @@ struct block
   }
 };
 
+/*
+Node * cacheMap = (Node *)malloc(sizeof(Node) * cacheSize);
+*/
+Node ** cacheMap = (Node **)malloc(sizeof(Node*) * cacheSize);
+
 //The cache is stored as an array of blocks
 // this allocates the cache dynamically
 block * fileBufferCache = (block *)malloc(sizeof(block) * cacheSize);
 block * diskBlocks = (block *)malloc(sizeof(block) * blocksOnDisk);
-aLock * blockLocks = (aLock *)malloc(sizeof(aLock) * blocksOnDisk);
 
+/*
+//Prepares the map to be used
+void initilizaeMap()
+{
+  int i;
+  //Initialize all cache spots to empty.
+  for(i = 0; i < cacheSize; i++)
+  {
+    cacheMap[i] = Node();
+    cacheMap[i].loc = i;
+    cacheMap[i].blockID = -1;
+    pthread_mutex_init(&cacheMap[i].lock);
+  }
+}
+*/
+void initilizaeMap()
+{
+  int i;
+  //Initialize all cache spots to empty.
+  for(i = 0; i < cacheSize; i++)
+  {
+    cacheMap[i] = (Node *)malloc(sizeof(Node));
+    cacheMap[i]->blockID = -1;
+    cacheMap[i]->loc = -1;
+    cacheMap[i]->next = NULL;
+    pthread_mutex_init(&cacheMap[i]->lock, NULL);
+  }
+}
+
+//Finds if a given block is in the cache, if it is then the lock for that
+//cache block is locked and the index of the block in the cache is returned.
+//If not, the value NOT_FOUND is returned.
+int findInMap(int blocknum)
+{
+  int hashVal = mapHash(blocknum);
+  Node * check = cacheMap[hashVal];
+  pthread_mutex_lock(&check->lock);
+  //Find blocknum if it is present
+  while(check->next != NULL && check->blockID != blocknum)
+  {
+    Node * prev = check;
+    check = check->next;
+    //Release the node you have already checked.
+    pthread_mutex_unlock(&prev->lock)
+    //Capture the lock of the node to be checked
+    pthread_mutex_lock(&check->lock);
+  }
+  //If it was not present, release the lock and return NOT_FOUND
+  if(check->blockID != blocknum)
+  {
+    pthread_mutex_unlock(&check->lock);
+    return NOT_FOUND;
+  }
+  //Capture the lock of the block that holds blocknum's data in the cache
+  pthread_mutex_lock(&fileBufferCache[check->loc].lock);
+  //If this is no longer the requested block, we must search again to see if
+  //it was added in a new location, hence the recursive call.
+  if(fileBufferCache[check->loc].id != blocknum)
+  {
+    pthread_mutex_unlock(&check->lock);
+    return findInMap(blocknum);
+  }
+  //If the block has been successfully found in the cache, take control of its
+  //lock and return its index in the cache so that the calling thread can use it
+  //without the possibility of a race condition.
+  pthread_mutex_unlock(&check->lock);
+  return check->loc;
+
+}
+
+void removeFromMap(int blocknum)
+{
+  int hashVal = mapHash(blocknum);
+  Node * check = cacheMap[hashVal];
+  pthread_mutex_lock(&check->lock);
+}
+
+void initializeCache()
+{
+
+}
+
+void initializeDisk()
+{
+
+}
 
 int placeInCache(int blocknum)
 {
   //Enter critical section
-  pthread_mutex_lock();
+  pthread_mutex_lock(&insertLock);
   //If this block has been written to, write it to memory
   fileBufferCache[replaceLoc]->
     //Enter critical section
@@ -89,11 +183,21 @@ int checkCache(int blocknum)
   //Check to see if the block is stored in the cache.
   while(i < cacheSize && blockLoc == NOT_FOUND)
   {
+    pthread_mutex_lock(&cacheMap[i].lock);
     //If the block is found, save its location.
-    if(fileBufferCache[i]->id == blocknum)
+    if(cacheMap[i].blockID == blocknum)
     {
-      return i;
+      //Capture the lock for this block
+      pthread_mutex_lock(&fileBufferCache[i].lock);
+      //See if it still contains the block
+      if(fileBufferCache[i].id == blocknum)
+      {
+        return i;
+      }
+      pthread_mutex_unlock(&fileBufferCache[i].lock);
+      return NOT_FOUND;
     }
+    pthread_mutex_unlock(&cacheMap[i].lock);
     i++;
   }
   return NOT_FOUND;

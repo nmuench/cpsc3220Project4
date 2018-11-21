@@ -6,16 +6,24 @@
 #define NOT_DIRTY 0
 #define DIRTY 1
 #define NOT_FOUND -1
+#define SEQUENTIAL 1
+#define RANDOM 0
+#define READ_ACCESS 1
+#define WRITE_ACCESS 0
 
 const int diskBlockSize = 1024; //The size of a disk block in bytes
 const int blocksOnDisk = 4096; //The number of blocks on the disk
 const int timeForIO = 1; //The time in ms for a diskread or diskwrite
 const int cacheSize = 64; //The size of the cache in blocks
+const int NUM_THREADS = 40;
+const int NUM_BLOCKS_SEQUENTIAL = 40;
+const int NUM_BLOCKS_RANDOM = 40;
 int numDiskReads = 0;
 int numDiskWrites = 0;
 int numBlockReads = 0;
 int numBlockWrites = 0;
 int numCacheHits = 0;
+int numMisses = 0;
 unsigned int currUse = 0;
 pthread_mutex_t diskLock;
 pthread_mutex_t diskQueueLock;
@@ -60,7 +68,6 @@ typedef struct cache_queue_def
   int queueSize;
   int maxQueueSize;
   Node2 * priorityQueue;
-  Node * unused;
 } cacheQueue;
 
 /*
@@ -145,6 +152,17 @@ void initializeDisk()
   pthread_mutex_init(&diskQueueLock, NULL);
   diskQueue = NULL;
   diskBlocks = (block *)malloc(sizeof(block) * blocksOnDisk);
+  int i;
+  int j;
+  for(i = 0; i < blocksOnDisk; i++)
+  {
+    diskBlocks[i].blockData = (char *)malloc(sizeof(char) * diskBlockSize);
+    pthread_mutex_init(&diskBlocks[i].lock, NULL);
+    for(j = 0; j < diskBlockSize; j++)
+    {
+      diskBlocks[i].blockData[j] = 'a' + (i % 26);
+    }
+  }
 }
 
 
@@ -284,6 +302,7 @@ void updateQueue(int nodeID, int nodeTime, int lastUseTime)
   {
     nodeQueue.priorityQueue[nodeQueue.queueSize + 1].blockID = nodeID;
     nodeQueue.priorityQueue[nodeQueue.queueSize + 1].useTime = nodeTime;
+    nodeQueue.queueSize++;
     siftUp(nodeQueue.queueSize + 1);
   }
   //Otherwise, update the key of the correct node
@@ -293,8 +312,7 @@ void updateQueue(int nodeID, int nodeTime, int lastUseTime)
     siftUp(i);
     siftDown(i);
   }
-
-  //Exit the critical section
+  //Enter the critical section
   pthread_mutex_unlock(&queueLock);
 }
 
@@ -326,7 +344,6 @@ int lookUpInMap(int blocknum)
       //Enter critical section of cache block
       pthread_mutex_lock(&fileBufferCache[returnVal].lock);
     }
-
   }
 
   //Note, at this point we still own the lock for the cache block if it exists,
@@ -340,7 +357,6 @@ void removeFromMap(int blocknum)
 {
   int hashVal = mapHash(blocknum);
   Node * check = cacheMap[hashVal];
-  Node * prev = check;
 
   //If there is nothing where it would be, return
   if(check == NULL)
@@ -361,14 +377,11 @@ void removeFromMap(int blocknum)
     return;
   }
 
-  //Enter critical Section
-  pthread_mutex_lock(&check->blockLock);
   //Resets that map location to map the block to not found.
   check->loc = NOT_FOUND;
-  //Exit the critical section.
+  //Exits the critical section of that map block
   pthread_mutex_unlock(&check->blockLock);
   return;
-
 }
 
 //Inserts a node containg the block and its index in the cache into the map
@@ -381,12 +394,8 @@ void insertIntoMap(int blocknum, int blockLoc)
   {
     check = check->next;
   }
-  //Enter the critical section
-  pthread_mutex_lock(&check->blockLock);
   //Set the map to map the blocknum to blockLock
   check->loc = blockLoc;
-  //Exit the critical section
-  pthread_mutex_unlock(&check->blockLock);
   return;
 
 }
@@ -402,7 +411,6 @@ void openMapBlock(int blocknum)
   {
     check = check->next;
   }
-  //Exits the critical section of that map block
   pthread_mutex_unlock(&check->blockLock);
 }
 
@@ -416,17 +424,31 @@ void openMapBlock(int blocknum)
 int chooseRemove(int blocknum)
 {
   int returnVal = NOT_FOUND;
-  int i = 0;
   int replaceBlockID;
   int checkTime;
+  //Enter critical section
+  pthread_mutex_lock(&useLock);
+  int storeUse = currUse;
+  currUse++;
+  //Exit critical section
+  pthread_mutex_unlock(&useLock);
+
   //enter the critical section
   pthread_mutex_lock(&queueLock);
   //If the cache has not yet been filled up, choose the next available cache
   //spot.
-  if(numDiskReads < cacheSize)
+  if(numMisses < cacheSize)
   {
-    //The cache will be filled in order.
-    returnVal = numDiskReads;
+    returnVal = numMisses;
+    numMisses++;
+    printf("MISSED\n");
+    nodeQueue.priorityQueue[returnVal].blockID = blocknum;
+    nodeQueue.priorityQueue[returnVal].useTime = storeUse;
+    //Done with the queue for the moment
+    pthread_mutex_unlock(&queueLock);
+    //Enter the critical section of that block
+    pthread_mutex_lock(&fileBufferCache[returnVal].lock);
+    fileBufferCache[returnVal].useTime = storeUse;
   }
   //If the queue has been filled, use LRU to select a cache location
   else
@@ -458,30 +480,28 @@ int chooseRemove(int blocknum)
      //Now remove the block that has been chosen from the map.
      removeFromMap(replaceBlockID);
      //Release control of that map block
-     openMapBlock(replaceBlockID);
+     //openMapBlock(replaceBlockID);
 
-     //Enter critical section
-     pthread_mutex_lock(&useLock);
-     int storeUse = currUse;
-     currUse++;
-     //Exit critical section
-     pthread_mutex_unlock(&useLock);
+
      fileBufferCache[returnVal].useTime = storeUse;
-
+     pthread_mutex_lock(&queueLock);
      //Now that we successfully have gained control of the LRU cache block,
      //which was in the first index of the priorityQueue, we must remove that
      //piece from the queue.
      removeMinFromQueue(blocknum, storeUse);
+     //Exit the critical section
+     pthread_mutex_unlock(&queueLock);
   }
 
-  //Exit the critical section
-  pthread_mutex_unlock(&queueLock);
+  insertIntoMap(blocknum, returnVal);
   return returnVal;
 }
 
 void diskblockread(char *x, int blocknum)
 {
+  pthread_mutex_lock(&useLock);
   numDiskReads++;
+  pthread_mutex_unlock(&useLock);
   //Enter critical section for placing into the FIFO queue
   pthread_mutex_lock(&diskQueueLock);
   diskNode * insNode = (diskNode *)malloc(sizeof(diskNode));
@@ -527,8 +547,12 @@ void diskblockread(char *x, int blocknum)
   pthread_mutex_lock(&diskQueueLock);
   //Remove the node from the diskQueue
   diskQueue = diskQueue->next;
-  //Signal the next disk request to proceed
-  pthread_cond_signal(&diskQueue->nodeCond);
+  //Check for more disk requests
+  if(diskQueue != NULL)
+  {
+    //Signal the next disk request to proceed
+    pthread_cond_signal(&diskQueue->nodeCond);
+  }
   //Exit critical section of the disk queue
   pthread_mutex_unlock(&diskQueueLock);
   //Exit the critical section of the read/write
@@ -540,8 +564,9 @@ void diskblockread(char *x, int blocknum)
 
 void diskblockwrite(char *x, int blocknum)
 {
+  pthread_mutex_lock(&useLock);
   numDiskWrites++;
-
+  pthread_mutex_unlock(&useLock);
   //Enter critical section for placing into the FIFO queue
   pthread_mutex_lock(&diskQueueLock);
   diskNode * insNode = (diskNode *)malloc(sizeof(diskNode));
@@ -588,8 +613,12 @@ void diskblockwrite(char *x, int blocknum)
   pthread_mutex_lock(&diskQueueLock);
   //Remove the node from the diskQueue
   diskQueue = diskQueue->next;
-  //Signal the next disk request to proceed
-  pthread_cond_signal(&diskQueue->nodeCond);
+  //Check for more disk requests
+  if(diskQueue != NULL)
+  {
+    //Signal the next disk request to proceed
+    pthread_cond_signal(&diskQueue->nodeCond);
+  }
   //Exit critical section of the disk queue
   pthread_mutex_unlock(&diskQueueLock);
   //Exit the critical section of the read/write
@@ -625,7 +654,9 @@ int placeInCache(int blocknum)
 
 void blockread(char *x, int blocknum)
 {
+  pthread_mutex_lock(&useLock);
   numBlockReads++;
+  pthread_mutex_unlock(&useLock);
   int i;
   int blockLoc = NOT_FOUND;
 
@@ -638,10 +669,13 @@ void blockread(char *x, int blocknum)
   {
     //Place the block into the cache
     blockLoc = placeInCache(blocknum);
+    printf("The lock for %d has been obtained\n", blockLoc);
   }
   //Update the use time in the queue if it was already in the cache
   else
   {
+    printf("The lock for %d has been obtained\n", blockLoc);
+
     //Enter critical section
     pthread_mutex_lock(&useLock);
     int storeUse = currUse;
@@ -659,6 +693,7 @@ void blockread(char *x, int blocknum)
     }
   //Exit critical section of cache
   pthread_mutex_unlock(&fileBufferCache[blockLoc].lock);
+  printf("The lock for %d was released\n", blockLoc);
   //Exit critical section of map block
   openMapBlock(blocknum);
 }
@@ -667,7 +702,9 @@ void blockread(char *x, int blocknum)
 
 void blockwrite(char *x, int blocknum)
 {
+  pthread_mutex_lock(&useLock);
   numBlockWrites++;
+  pthread_mutex_unlock(&useLock);
   int blockLoc = -1;
   int i;
   //Use the map to find the index of the block in the cache, if it is in the
@@ -705,6 +742,153 @@ void blockwrite(char *x, int blocknum)
   openMapBlock(blocknum);
 }
 
+void tearDown()
+{
+  int i;
 
-//PREP FOR CASE OF MULTIPLE READS AND WRITES ASKING FOR SAME BLOCK WHICH ISNT IN CACHE YET.
-//NEED TO ENSURE CONCURRENT READS/WRITES ARE OK.
+  pthread_mutex_destroy(&useLock);
+
+  //Destroy the disk
+  pthread_mutex_destroy(&diskLock);
+  for(i = 0; i < blocksOnDisk; i++)
+  {
+    pthread_mutex_destroy(&diskBlocks[i].lock);
+    free(diskBlocks[i].blockData);
+  }
+  free(diskBlocks);
+  pthread_mutex_destroy(&diskQueueLock);
+  //Destroy the diskQueue
+  while(diskQueue != NULL)
+  {
+    diskNode * toDelete = diskQueue;
+    diskQueue = diskQueue->next;
+    destroyDiskNode(toDelete);
+  }
+
+  //Destroy the map
+  for(i = 0; i < cacheSize; i++)
+  {
+    while(cacheMap[i] != NULL)
+    {
+      Node * toDestroy = cacheMap[i];
+      cacheMap[i] = cacheMap[i]->next;
+      destroyNode(toDestroy);
+    }
+  }
+  //Destroy the cacheQueue
+  pthread_mutex_destroy(&queueLock);
+  free(nodeQueue.priorityQueue);
+  //Destroy the cache
+  for(i = 0; i < cacheSize; i++)
+  {
+    pthread_mutex_destroy(&fileBufferCache[i].lock);
+    free(fileBufferCache[i].blockData);
+  }
+  free(fileBufferCache);
+}
+
+//Sequentially accesses NUM_BLOCKS_SEQUENTIAL on the disk, starting at a
+//random block. accessType is READ_ACCESS for a read and WRITE_ACCESS for a write
+void sequentialAccess(int accessType)
+{
+  //Generates the random block to start from.
+  int startBlock = 0;
+  int x;
+
+  //Performs the reads if asked to
+  if(accessType == READ_ACCESS)
+  {
+    //Generate somewhere to store the read data.
+    char ** storeData = (char **)malloc(sizeof(char *) * NUM_BLOCKS_SEQUENTIAL);
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      storeData[x] = (char *)malloc(sizeof(char) * diskBlockSize);
+    }
+    //Accesses the blocks
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      int accessBlock = startBlock + x;
+      blockread(storeData[x], accessBlock);
+      /*
+      int j;
+      for(j = 0; j < diskBlockSize; j++)
+      {
+        printf("%c", storeData[x][j]);
+      }
+      printf("\n");
+      */
+    }
+  }
+  //Performs the writes if asked to
+  if(accessType == WRITE_ACCESS)
+  {
+    //Accesses the blocks
+    for(x = 0; x < NUM_BLOCKS_RANDOM; x++)
+    {
+
+    }
+  }
+
+}
+
+void randomAccess(int accessType)
+{
+
+}
+
+//NEED TO IMPELEMENT TWO DIFFERENT KINDS OF THREAD, SEQUENTIAL AND RANDOM
+//EACH THREAD NEEDS TO READ OR WRITE FROM THE CACHE.
+void *worker(void *args)
+{
+  //Name of the thread
+	int threadId =*((int *) args);
+  //This is the type of thread being created. It will either be
+  //SEQUENTIAL or RANDOM
+  int threadType = *(((int *) args) + 1);
+  printf("Beginning thread %d which is of type %d\n", threadId, threadType);
+  if(threadType == SEQUENTIAL)
+  {
+    sequentialAccess(READ_ACCESS);
+  }
+  if(threadType == RANDOM)
+  {
+    randomAccess(READ_ACCESS);
+  }
+  printf("Exiting thread %d now\n", threadId);
+  pthread_exit(NULL);
+}
+
+int main()
+{
+  initializeMap();
+  initializeDisk();
+  initializeCache();
+  initializeQueue();
+  pthread_t threads[40];
+	int i;
+	int rc;
+	int args[2][2]=		//pairs of thread id and access type
+		{{0,SEQUENTIAL},{1,SEQUENTIAL}};
+
+	for(i = 0; i < 2; i++)
+	{
+		rc = pthread_create(&threads[i], NULL, &worker, (void *)(args[i]));
+		if(rc)
+		{
+			printf("** could not create thread %d\n",i); exit(-1);
+		}
+	}
+
+	for(i = 0; i < 2; i++)
+	{
+		rc = pthread_join(threads[i], NULL);
+		if(rc)
+		{
+			printf("** could not join thread %d\n", i); exit(-1);
+			tearDown(); return 0;
+		}
+	}
+
+  tearDown();
+  return 0;
+}

@@ -1,0 +1,115 @@
+==22107== Helgrind, a thread error detector
+==22107== Copyright (C) 2007-2015, and GNU GPL'd, by OpenWorks LLP et al.
+==22107== Using Valgrind-3.11.0 and LibVEX; rerun with -h for copyright info
+==22107== Command: ./a.out
+==22107== 
+==22107== ---Thread-Announcement------------------------------------------
+==22107== 
+==22107== Thread #3 was created
+==22107==    at 0x51643DE: clone (clone.S:74)
+==22107==    by 0x4E46149: create_thread (createthread.c:102)
+==22107==    by 0x4E47E83: pthread_create@@GLIBC_2.2.5 (pthread_create.c:679)
+==22107==    by 0x4C34BB7: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x402257: main (blockio.c:881)
+==22107== 
+==22107== ----------------------------------------------------------------
+==22107== 
+==22107== Thread #3: lock order "0x6030E0 before 0x5927598" violated
+==22107== 
+==22107== Observed (incorrect) order is: acquisition of lock at 0x5927598
+==22107==    at 0x4C321BC: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x401432: lookUpInMap (blockio.c:340)
+==22107==    by 0x401BC6: blockread (blockio.c:665)
+==22107==    by 0x4020ED: sequentialAccess (blockio.c:817)
+==22107==    by 0x402170: worker (blockio.c:857)
+==22107==    by 0x4C34DB6: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x4E476B9: start_thread (pthread_create.c:333)
+==22107== 
+==22107==  followed by a later acquisition of lock at 0x6030E0
+==22107==    at 0x4C321BC: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x401C17: blockread (blockio.c:684)
+==22107==    by 0x4020ED: sequentialAccess (blockio.c:817)
+==22107==    by 0x402170: worker (blockio.c:857)
+==22107==    by 0x4C34DB6: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x4E476B9: start_thread (pthread_create.c:333)
+==22107== 
+==22107== Required order was established by acquisition of lock at 0x6030E0
+==22107==    at 0x4C321BC: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x40159B: chooseRemove (blockio.c:425)
+==22107==    by 0x401B02: placeInCache (blockio.c:639)
+==22107==    by 0x401BD9: blockread (blockio.c:671)
+==22107==    by 0x4020ED: sequentialAccess (blockio.c:817)
+==22107==    by 0x402170: worker (blockio.c:857)
+==22107==    by 0x4C34DB6: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x4E476B9: start_thread (pthread_create.c:333)
+==22107== 
+==22107==  followed by a later acquisition of lock at 0x5927598
+==22107==    at 0x4C321BC: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x401603: chooseRemove (blockio.c:438)
+==22107==    by 0x401B02: placeInCache (blockio.c:639)
+==22107==    by 0x401BD9: blockread (blockio.c:671)
+==22107==    by 0x4020ED: sequentialAccess (blockio.c:817)
+==22107==    by 0x402170: worker (blockio.c:857)
+==22107==    by 0x4C34DB6: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x4E476B9: start_thread (pthread_create.c:333)
+==22107== 
+==22107==  Lock at 0x6030E0 was first observed
+==22107==    at 0x4C321BC: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x40159B: chooseRemove (blockio.c:425)
+==22107==    by 0x401B02: placeInCache (blockio.c:639)
+==22107==    by 0x401BD9: blockread (blockio.c:671)
+==22107==    by 0x4020ED: sequentialAccess (blockio.c:817)
+==22107==    by 0x402170: worker (blockio.c:857)
+==22107==    by 0x4C34DB6: ??? (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x4E476B9: start_thread (pthread_create.c:333)
+==22107==  Address 0x6030e0 is 0 bytes inside data symbol "queueLock"
+==22107== 
+==22107==  Lock at 0x5927598 was first observed
+==22107==    at 0x4C360BA: pthread_mutex_init (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x400D8C: initializeCache (blockio.c:143)
+==22107==    by 0x4021D6: main (blockio.c:871)
+==22107==  Address 0x5927598 is 24 bytes inside a block of size 4,096 alloc'd
+==22107==    at 0x4C2EFAF: malloc (in /usr/lib/valgrind/vgpreload_helgrind-amd64-linux.so)
+==22107==    by 0x400CDC: initializeCache (blockio.c:134)
+==22107==    by 0x4021D6: main (blockio.c:871)
+==22107==  Block was alloc'd by thread #1
+==22107== 
+==22107== 
+--22107-- WARNING: Serious error when reading debug info
+--22107-- When reading debug info from /lib/x86_64-linux-gnu/libgcc_s.so.1:
+--22107-- Ignoring non-Dwarf2/3/4 block in .debug_info
+--22107-- WARNING: Serious error when reading debug info
+--22107-- When reading debug info from /lib/x86_64-linux-gnu/libgcc_s.so.1:
+--22107-- Last block truncated in .debug_info; ignoring
+--22107-- WARNING: Serious error when reading debug info
+--22107-- When reading debug info from /lib/x86_64-linux-gnu/libgcc_s.so.1:
+--22107-- parse_CU_Header: is neither DWARF2 nor DWARF3 nor DWARF4
+Beginning thread 0 which is of type 1
+Beginning thread 1 which is of type 1
+The lock for 0 has been obtained
+The lock for 0 was released
+The lock for 0 has been obtained
+The lock for 0 was released
+The lock for 1 has been obtained
+The lock for 1 was released
+The lock for 1 has been obtained
+The lock for 1 was released
+The lock for 2 has been obtained
+The lock for 2 was released
+The lock for 2 has been obtained
+The lock for 2 was released
+The lock for 3 has been obtained
+The lock for 3 was released
+The lock for 3 has been obtained
+The lock for 3 was released
+The lock for 4 has been obtained
+The lock for 4 was released
+Exiting thread 0 now
+The lock for 4 has been obtained
+The lock for 4 was released
+Exiting thread 1 now
+==22107== 
+==22107== For counts of detected and suppressed errors, rerun with: -v
+==22107== Use --history-level=approx or =none to gain increased speed, at
+==22107== the cost of reduced accuracy of conflicting-access information
+==22107== ERROR SUMMARY: 5 errors from 1 contexts (suppressed: 367 from 99)

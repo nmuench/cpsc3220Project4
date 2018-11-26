@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <time.h>
 #include <pthread.h>
 
 #define NOT_DIRTY 0
@@ -10,6 +11,7 @@
 #define RANDOM 0
 #define READ_ACCESS 1
 #define WRITE_ACCESS 0
+#define CURRENTLY_USING -2
 
 const int diskBlockSize = 1024; //The size of a disk block in bytes
 const int blocksOnDisk = 4096; //The number of blocks on the disk
@@ -24,6 +26,7 @@ int numBlockReads = 0;
 int numBlockWrites = 0;
 int numCacheHits = 0;
 int numMisses = 0;
+double timeTaken;
 unsigned int currUse = 0;
 pthread_mutex_t diskLock;
 pthread_mutex_t diskQueueLock;
@@ -36,6 +39,7 @@ typedef struct node_def
   int loc;
   int blockID;
   pthread_mutex_t blockLock;
+  pthread_cond_t mapCond;
   struct node_def * next;
 } Node;
 
@@ -90,16 +94,16 @@ block * diskBlocks;
 //Returns a hash of the int val that is taken in a a parameter.
 int mapHash(int val)
 {
-  int hashVal = (val * 334791) % cacheSize;
+  int hashVal = (val * 334791 + 473846) % blocksOnDisk;
   return hashVal;
 }
 
 void initializeMap()
 {
-  cacheMap = (Node **)malloc(sizeof(Node*) * cacheSize);
+  cacheMap = (Node **)malloc(sizeof(Node*) * blocksOnDisk);
   int i;
   //Fill the cache with NULL nodes
-  for(i = 0; i < cacheSize; i++)
+  for(i = 0; i < blocksOnDisk; i++)
   {
     cacheMap[i] = NULL;
   }
@@ -111,6 +115,7 @@ void initializeMap()
     insNode->blockID = i;
     insNode->loc = NOT_FOUND;
     insNode->next = cacheMap[hashNum];
+    pthread_cond_init(&insNode->mapCond, NULL);
     pthread_mutex_init(&insNode->blockLock, NULL);
     cacheMap[hashNum] = insNode;
   }
@@ -169,6 +174,7 @@ void initializeDisk()
 void destroyNode(Node * toDestroy)
 {
   pthread_mutex_destroy(&toDestroy->blockLock);
+  pthread_cond_destroy(&toDestroy->mapCond);
   free(toDestroy);
 }
 
@@ -192,8 +198,13 @@ void siftDown(int i)
     int leftChild = 2 * i + 1;
     int rightChild = 2 * i + 2;
     int minChild = leftChild;
+
+    if(leftChild >= nodeQueue.queueSize)
+    {
+      return;
+    }
     //Determines which child is the minChild
-    if(nodeQueue.priorityQueue[rightChild].useTime < nodeQueue.priorityQueue[leftChild].useTime)
+    if(rightChild < nodeQueue.queueSize && nodeQueue.priorityQueue[rightChild].useTime < nodeQueue.priorityQueue[leftChild].useTime)
     {
       //If true, then the rightChild is the minChild
       minChild = rightChild;
@@ -270,6 +281,10 @@ int findInQueue(int blockID, int i, int lookTime)
   {
     return i;
   }
+  if(((2 * i) + 1) > nodeQueue.queueSize)
+  {
+    return NOT_FOUND;
+  }
   int leftChild = 2 * i + 1;
   int rightChild = 2 * i + 2;
   int storeVal = NOT_FOUND;
@@ -279,10 +294,10 @@ int findInQueue(int blockID, int i, int lookTime)
     storeVal = findInQueue(blockID, leftChild, lookTime);
   }
   //If it has not yet been found
-  if(storeVal != -1)
+  if(storeVal == -1)
   {
     //If the right child is less than or equal to, recurse.
-    if(nodeQueue.priorityQueue[rightChild].useTime <= lookTime)
+    if(((2 * i) + 2) < nodeQueue.queueSize && nodeQueue.priorityQueue[rightChild].useTime <= lookTime)
     {
       storeVal = findInQueue(blockID, rightChild, lookTime);
     }
@@ -303,7 +318,7 @@ void updateQueue(int nodeID, int nodeTime, int lastUseTime)
     nodeQueue.priorityQueue[nodeQueue.queueSize + 1].blockID = nodeID;
     nodeQueue.priorityQueue[nodeQueue.queueSize + 1].useTime = nodeTime;
     nodeQueue.queueSize++;
-    siftUp(nodeQueue.queueSize + 1);
+    siftUp(nodeQueue.queueSize);
   }
   //Otherwise, update the key of the correct node
   else
@@ -337,13 +352,26 @@ int lookUpInMap(int blocknum)
   {
     //Locks the map entry for that block
     pthread_mutex_lock(&check->blockLock);
+
+    //Waits if the node is being used by another thread.
+    while(check->loc == CURRENTLY_USING)
+    {
+      pthread_cond_wait(&check->mapCond, &check->blockLock);
+    }
+
     returnVal = check->loc;
+    //Mark this block as in use
+    check->loc = CURRENTLY_USING;
+    //Exit the critical section of the map
+    pthread_mutex_unlock(&check->blockLock);
+
     //Enter the critical section if the block is in the cache
     if(returnVal != NOT_FOUND)
     {
       //Enter critical section of cache block
       pthread_mutex_lock(&fileBufferCache[returnVal].lock);
     }
+
   }
 
   //Note, at this point we still own the lock for the cache block if it exists,
@@ -376,32 +404,18 @@ void removeFromMap(int blocknum)
   {
     return;
   }
-
+  pthread_mutex_lock(&check->blockLock);
   //Resets that map location to map the block to not found.
   check->loc = NOT_FOUND;
+
+  pthread_cond_signal(&check->mapCond);
   //Exits the critical section of that map block
   pthread_mutex_unlock(&check->blockLock);
   return;
 }
 
-//Inserts a node containg the block and its index in the cache into the map
-void insertIntoMap(int blocknum, int blockLoc)
-{
-  int hashVal = mapHash(blocknum);
-  Node * check = cacheMap[hashVal];
-  //Find the block in the map
-  while(check->blockID != blocknum)
-  {
-    check = check->next;
-  }
-  //Set the map to map the blocknum to blockLock
-  check->loc = blockLoc;
-  return;
-
-}
-
 //Releases the lock of the given blocknum in the map
-void openMapBlock(int blocknum)
+void openMapBlock(int blocknum, int indexVal)
 {
   int hashVal = mapHash(blocknum);
   Node * check = cacheMap[hashVal];
@@ -411,9 +425,12 @@ void openMapBlock(int blocknum)
   {
     check = check->next;
   }
+  pthread_mutex_lock(&check->blockLock);
+  check->loc = indexVal;
+  pthread_cond_signal(&check->mapCond);
   pthread_mutex_unlock(&check->blockLock);
-}
 
+}
 
 
 //Uses LRU to decide what cache block to replace, return the index of the cache
@@ -430,6 +447,8 @@ int chooseRemove(int blocknum)
   pthread_mutex_lock(&useLock);
   int storeUse = currUse;
   currUse++;
+  int missNum = numMisses;
+  numMisses++;
   //Exit critical section
   pthread_mutex_unlock(&useLock);
 
@@ -437,13 +456,13 @@ int chooseRemove(int blocknum)
   pthread_mutex_lock(&queueLock);
   //If the cache has not yet been filled up, choose the next available cache
   //spot.
-  if(numMisses < cacheSize)
+  if(missNum < cacheSize)
   {
-    returnVal = numMisses;
-    numMisses++;
-    printf("MISSED\n");
+    returnVal = missNum;
+
     nodeQueue.priorityQueue[returnVal].blockID = blocknum;
     nodeQueue.priorityQueue[returnVal].useTime = storeUse;
+    nodeQueue.queueSize++;
     //Done with the queue for the moment
     pthread_mutex_unlock(&queueLock);
     //Enter the critical section of that block
@@ -453,7 +472,13 @@ int chooseRemove(int blocknum)
   //If the queue has been filled, use LRU to select a cache location
   else
   {
-    //Selects the current least revently used node
+    //Enter critical section
+    pthread_mutex_lock(&useLock);
+    numMisses--;
+    //Exit critical section
+    pthread_mutex_unlock(&useLock);
+
+    //Selects the current least recently used node
     replaceBlockID = nodeQueue.priorityQueue[0].blockID;
     checkTime = nodeQueue.priorityQueue[0].useTime;
     //Done with the queue for now
@@ -462,11 +487,15 @@ int chooseRemove(int blocknum)
     //process began.
     returnVal = lookUpInMap(replaceBlockID);
     //Repeat this until the cache spot is actually the LRU slot
-    while(checkTime != fileBufferCache[returnVal].useTime)
-     {
-       //Release cotnrol of the cache spot and the map block
-       pthread_mutex_unlock(&fileBufferCache[returnVal].lock);
-       openMapBlock(returnVal);
+    while(returnVal == -1 || checkTime != fileBufferCache[returnVal].useTime)
+    {
+       //Only release if it is a valid block
+       if(returnVal != -1)
+       {
+         //Release control of the cache spot and the map block
+         pthread_mutex_unlock(&fileBufferCache[returnVal].lock);
+       }
+       openMapBlock(replaceBlockID, returnVal);
        //Enter critical section of the queue
        pthread_mutex_lock(&queueLock);
        //Selects the current least recently used node
@@ -482,18 +511,14 @@ int chooseRemove(int blocknum)
      //Release control of that map block
      //openMapBlock(replaceBlockID);
 
-
      fileBufferCache[returnVal].useTime = storeUse;
-     pthread_mutex_lock(&queueLock);
      //Now that we successfully have gained control of the LRU cache block,
      //which was in the first index of the priorityQueue, we must remove that
      //piece from the queue.
      removeMinFromQueue(blocknum, storeUse);
-     //Exit the critical section
-     pthread_mutex_unlock(&queueLock);
   }
 
-  insertIntoMap(blocknum, returnVal);
+  //insertIntoMap(blocknum, returnVal);
   return returnVal;
 }
 
@@ -644,6 +669,8 @@ int placeInCache(int blocknum)
     diskblockwrite(fileBufferCache[replaceLoc].blockData, fileBufferCache[replaceLoc].id);
   }
   //Replace the block chosen with the block requested
+  fileBufferCache[replaceLoc].id = blocknum;
+  fileBufferCache[replaceLoc].dirtyBit = NOT_DIRTY;
   diskblockread(fileBufferCache[replaceLoc].blockData, blocknum);
   return replaceLoc;
 }
@@ -669,15 +696,13 @@ void blockread(char *x, int blocknum)
   {
     //Place the block into the cache
     blockLoc = placeInCache(blocknum);
-    printf("The lock for %d has been obtained\n", blockLoc);
   }
   //Update the use time in the queue if it was already in the cache
   else
   {
-    printf("The lock for %d has been obtained\n", blockLoc);
-
     //Enter critical section
     pthread_mutex_lock(&useLock);
+    numCacheHits++;
     int storeUse = currUse;
     currUse++;
     //Exit critical section
@@ -686,6 +711,7 @@ void blockread(char *x, int blocknum)
     updateQueue(blocknum, storeUse, fileBufferCache[blockLoc].useTime);
     fileBufferCache[blockLoc].useTime = storeUse;
   }
+  //printf("The lock for %d is in use by block %d\n", blockLoc, blocknum);
   //Read from the block in the cache into x.
   for(i = 0; i < diskBlockSize; i++)
   {
@@ -693,9 +719,9 @@ void blockread(char *x, int blocknum)
     }
   //Exit critical section of cache
   pthread_mutex_unlock(&fileBufferCache[blockLoc].lock);
-  printf("The lock for %d was released\n", blockLoc);
+  //printf("The lock for %d was released by block %d\n", blockLoc, blocknum);
   //Exit critical section of map block
-  openMapBlock(blocknum);
+  openMapBlock(blocknum, blockLoc);
 }
 
 
@@ -722,6 +748,7 @@ void blockwrite(char *x, int blocknum)
   {
     //Enter critical section
     pthread_mutex_lock(&useLock);
+    numCacheHits++;
     int storeUse = currUse;
     currUse++;
     //Exit critical section
@@ -730,6 +757,7 @@ void blockwrite(char *x, int blocknum)
     updateQueue(blocknum, storeUse, fileBufferCache[blockLoc].useTime);
     fileBufferCache[blockLoc].useTime = storeUse;
   }
+  //printf("The lock for %d is in use by block %d\n", blockLoc, blocknum);
   //Write to the block from x
   for(i = 0; i < diskBlockSize; i++)
   {
@@ -738,8 +766,9 @@ void blockwrite(char *x, int blocknum)
   fileBufferCache[blockLoc].dirtyBit = DIRTY;
   //Exit critical section of cache
   pthread_mutex_unlock(&fileBufferCache[blockLoc].lock);
+  //printf("The lock for %d was released by block %d\n", blockLoc, blocknum);
   //Exit critical section of map block
-  openMapBlock(blocknum);
+  openMapBlock(blocknum, blockLoc);
 }
 
 void tearDown()
@@ -789,10 +818,10 @@ void tearDown()
 
 //Sequentially accesses NUM_BLOCKS_SEQUENTIAL on the disk, starting at a
 //random block. accessType is READ_ACCESS for a read and WRITE_ACCESS for a write
-void sequentialAccess(int accessType)
+void sequentialAccess(int accessType, int threadNum)
 {
   //Generates the random block to start from.
-  int startBlock = 0;
+  int startBlock = (rand() % (blocksOnDisk - 40));
   int x;
 
   //Performs the reads if asked to
@@ -808,32 +837,86 @@ void sequentialAccess(int accessType)
     for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
     {
       int accessBlock = startBlock + x;
+      //printf("Thread %d, needs block %d\n", threadNum, accessBlock);
       blockread(storeData[x], accessBlock);
-      /*
-      int j;
-      for(j = 0; j < diskBlockSize; j++)
-      {
-        printf("%c", storeData[x][j]);
-      }
-      printf("\n");
-      */
+      free(storeData[x]);
     }
+    free(storeData);
   }
   //Performs the writes if asked to
   if(accessType == WRITE_ACCESS)
   {
-    //Accesses the blocks
-    for(x = 0; x < NUM_BLOCKS_RANDOM; x++)
+    char ** writeChars = (char **)malloc(sizeof(char *) * NUM_BLOCKS_SEQUENTIAL);
+    //Generate the write chars
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
     {
-
+      writeChars[x] = (char *)malloc(sizeof(char) * diskBlockSize);
+      int j;
+      for(j = 0; j < diskBlockSize; j++)
+      {
+        writeChars[x][j] = 'a' + (x % 27);
+      }
     }
+    //Accesses the blocks
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      int accessBlock = startBlock + x;
+      //printf("Thread %d, needs block %d\n", threadNum, accessBlock);
+      blockwrite(writeChars[x], accessBlock);
+      free(writeChars[x]);
+    }
+    free(writeChars);
   }
-
 }
 
-void randomAccess(int accessType)
+void randomAccess(int accessType, int threadNum)
 {
+  //Generates the random block to start from.
+  int x;
 
+  //Performs the reads if asked to
+  if(accessType == READ_ACCESS)
+  {
+    //Generate somewhere to store the read data.
+    char ** storeData = (char **)malloc(sizeof(char *) * NUM_BLOCKS_SEQUENTIAL);
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      storeData[x] = (char *)malloc(sizeof(char) * diskBlockSize);
+    }
+    //Accesses the blocks
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      int accessBlock = rand() % blocksOnDisk;
+      //printf("Thread %d, needs block %d\n", threadNum, accessBlock);
+      blockread(storeData[x], accessBlock);
+      free(storeData[x]);
+    }
+    free(storeData);
+  }
+  //Performs the writes if asked to
+  if(accessType == WRITE_ACCESS)
+  {
+    char ** writeChars = (char **)malloc(sizeof(char *) * NUM_BLOCKS_SEQUENTIAL);
+    //Generate the write chars
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      writeChars[x] = (char *)malloc(sizeof(char) * diskBlockSize);
+      int j;
+      for(j = 0; j < diskBlockSize; j++)
+      {
+        writeChars[x][j] = 'a' + (x % 27);
+      }
+    }
+    //Accesses the blocks
+    for(x = 0; x < NUM_BLOCKS_SEQUENTIAL; x++)
+    {
+      int accessBlock = rand() % blocksOnDisk;
+      //printf("Thread %d, needs block %d\n", threadNum, accessBlock);
+      blockwrite(writeChars[x], accessBlock);
+      free(writeChars[x]);
+    }
+    free(writeChars);
+  }
 }
 
 //NEED TO IMPELEMENT TWO DIFFERENT KINDS OF THREAD, SEQUENTIAL AND RANDOM
@@ -841,54 +924,139 @@ void randomAccess(int accessType)
 void *worker(void *args)
 {
   //Name of the thread
-	int threadId =*((int *) args);
+	int threadId = *((int *) args);
+  srand(threadId);
   //This is the type of thread being created. It will either be
   //SEQUENTIAL or RANDOM
   int threadType = *(((int *) args) + 1);
+  int threadFunc = *(((int *) args) + 2);
   printf("Beginning thread %d which is of type %d\n", threadId, threadType);
   if(threadType == SEQUENTIAL)
   {
-    sequentialAccess(READ_ACCESS);
+    sequentialAccess(threadFunc, threadId);
   }
   if(threadType == RANDOM)
   {
-    randomAccess(READ_ACCESS);
+    randomAccess(threadFunc, threadId);
   }
   printf("Exiting thread %d now\n", threadId);
   pthread_exit(NULL);
 }
 
-int main()
+void finishUp()
+{
+  int totalBlockAccesses = numBlockReads + numBlockWrites;
+  double cacheRatio = (double)numCacheHits / (double)totalBlockAccesses;
+  printf("numDiskReads: %d\n", numDiskReads);
+  printf("numDiskWrites: %d\n", numDiskWrites);
+  printf("totalBlockAccesses: %d\n", totalBlockAccesses);
+  printf("numCacheHits: %d\n", numCacheHits);
+  printf("Total time taken was: %f seconds\n", timeTaken);
+  printf("Cache hit ratio: %d / %d = %f\n", numCacheHits, totalBlockAccesses, cacheRatio);
+
+
+  return;
+}
+
+
+void runWithSequential()
 {
   initializeMap();
   initializeDisk();
   initializeCache();
   initializeQueue();
   pthread_t threads[40];
-	int i;
-	int rc;
-	int args[2][2]=		//pairs of thread id and access type
-		{{0,SEQUENTIAL},{1,SEQUENTIAL}};
+  clock_t startClock;
+  clock_t endClock;
+  int i;
+  int rc;
+  int args[40][3]=		//pairs of thread id and access type
+    {};
 
-	for(i = 0; i < 2; i++)
-	{
-		rc = pthread_create(&threads[i], NULL, &worker, (void *)(args[i]));
-		if(rc)
-		{
-			printf("** could not create thread %d\n",i); exit(-1);
-		}
-	}
+  for(i = 0; i < NUM_THREADS; i++)
+  {
+    args[i][0] = i;
+    args[i][1] = SEQUENTIAL;
+    args[i][2] = ((i % 2) == 1) ? WRITE_ACCESS : READ_ACCESS;
+  }
 
-	for(i = 0; i < 2; i++)
-	{
-		rc = pthread_join(threads[i], NULL);
-		if(rc)
-		{
-			printf("** could not join thread %d\n", i); exit(-1);
-			tearDown(); return 0;
-		}
-	}
 
+  for(i = 0; i < NUM_THREADS; i++)
+  {
+    rc = pthread_create(&threads[i], NULL, &worker, (void *)(args[i]));
+    if(rc)
+    {
+      printf("** could not create thread %d\n",i); exit(-1);
+    }
+  }
+
+  startClock = clock();
+  for(i = 0; i < NUM_THREADS; i++)
+  {
+    rc = pthread_join(threads[i], NULL);
+    if(rc)
+    {
+      printf("** could not join thread %d\n", i); exit(-1);
+      tearDown();
+    }
+  }
+  endClock = clock();
+  timeTaken = ((double)(endClock - startClock)) / CLOCKS_PER_SEC;
+
+  finishUp();
+}
+
+void runWithRandom()
+{
+  initializeMap();
+  initializeDisk();
+  initializeCache();
+  initializeQueue();
+  pthread_t threads[40];
+  clock_t startClock;
+  clock_t endClock;
+  int i;
+  int rc;
+  int args[40][3]=		//pairs of thread id and access type
+    {};
+
+  for(i = 0; i < NUM_THREADS; i++)
+  {
+    args[i][0] = i;
+    args[i][1] = RANDOM;
+    args[i][2] = ((i % 2) == 1) ? WRITE_ACCESS : READ_ACCESS;
+  }
+
+  startClock = clock();
+  for(i = 0; i < NUM_THREADS; i++)
+  {
+    rc = pthread_create(&threads[i], NULL, &worker, (void *)(args[i]));
+    if(rc)
+    {
+      printf("** could not create thread %d\n",i); exit(-1);
+    }
+  }
+
+  for(i = 0; i < NUM_THREADS; i++)
+  {
+    rc = pthread_join(threads[i], NULL);
+    if(rc)
+    {
+      printf("** could not join thread %d\n", i); exit(-1);
+      tearDown();
+    }
+  }
+
+  endClock = clock();
+  timeTaken = ((double)(endClock - startClock)) / CLOCKS_PER_SEC;
+
+  finishUp();
+}
+
+int main()
+{
+  runWithSequential();
+  //runWithRandom();
   tearDown();
   return 0;
 }
